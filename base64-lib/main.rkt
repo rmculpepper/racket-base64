@@ -237,7 +237,8 @@
   (define content-ranges (regexp-match-positions* content-rx src))
   (case mode
     [(strict)
-     (cond [(equal? content-ranges (list (cons 0 (bytes-length src))))
+     (cond [(zero? (bytes-length src)) #""]
+           [(equal? content-ranges (list (cons 0 (bytes-length src))))
             (do-dec src)]
            [else (error who "bad base64 encoding (strict mode)\n  input: ~e" src)])]
     [else
