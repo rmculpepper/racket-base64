@@ -36,8 +36,7 @@
 
 (define input/c (or/c bytes? string? input-port?))
 (define endcodes/c (or/c '#f 'url (and/c bytes? #rx#"^..$")))
-(define (line/c v)
-  (and (exact-positive-integer? v) (zero? (remainder v 4))))
+(define (line/c v) (or/c #f (and (exact-positive-integer? v) (zero? (remainder v 4)))))
 (define line-sep/c (and/c bytes? #px#"^[[:space:]]*$"))
 
 ;; Note: Nat[6-bit] = [0, 63], etc
