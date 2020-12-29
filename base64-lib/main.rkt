@@ -1,7 +1,10 @@
 ;; Copyright 2018-2020 Ryan Culpepper
+;; Licensed under the Apache License, Version 2.0
 
 #lang racket/base
-(require racket/contract/base)
+(require racket/contract/base
+         racket/list
+         syntax/readerr)
 
 ;; References:
 ;; - https://tools.ietf.org/html/rfc4648
@@ -13,14 +16,14 @@
            (->* [input/c]
                 [#:endcodes endcodes/c
                  #:line line/c
-                 #:line-sep line-sep/c
+                 #:line-end line-end/c
                  #:pad? boolean?]
                 bytes?)]
           [base64-encode-stream
            (->* [input/c output-port?]
                 [#:endcodes endcodes/c
                  #:line line/c
-                 #:line-sep line-sep/c
+                 #:line-end line-end/c
                  #:pad? boolean?]
                 void?)]
           [base64-decode
@@ -35,9 +38,10 @@
                 void?)]))
 
 (define input/c (or/c bytes? string? input-port?))
-(define endcodes/c (or/c '#f 'url (and/c bytes? #rx#"^..$")))
+(define (endcodes/c v)
+  (or (eq? v #f) (eq? v 'url) (and (bytes? v) (= (bytes-length v) 2))))
 (define (line/c v) (or/c #f (and (exact-positive-integer? v) (zero? (remainder v 4)))))
-(define line-sep/c (and/c bytes? #px#"^[[:space:]]*$"))
+(define line-end/c (and/c bytes? #px#"^[[:space:]]*$"))
 
 ;; Note: Nat[6-bit] = [0, 63], etc
 
@@ -106,23 +110,22 @@
 ;; ------------------------------------------------------------
 
 ;; decode : Bytes Bytes[2] -> Bytes
-(define (decode src endcodes #:who who)
+(define (decode src endcodes [start 0] [end (bytes-length src)] #:who who)
   (define (dc k) (decode1 endcodes k #:who who))
-  (define srclen (bytes-length src))
+  (define srclen (- end start))
   (define outlen
     (+ (* 3 (quotient srclen 4))
        (case (remainder srclen 4) [(0) 0] [(2) 1] [(3) 2])))
   (define out (make-bytes outlen))
-  ;; Decode main part (full quads)
-  (for ([srci (in-range 0 srclen 4)]
+  (for ([srci (in-range start end 4)]
         [outi (in-range 0 outlen 3)])
-    (define n (read-quad src srci srclen dc))
+    (define n (read-quad src srci end dc))
     (write-triplet out outi outlen n))
   out)
 
 ;; read-quad : Bytes Nat Nat (Byte -> Nat[6-bit]) -> Nat[24-bit]
-(define (read-quad src srci srclen dc)
-  (define (get srci) (if (< srci srclen) (dc (bytes-ref src srci)) 0))
+(define (read-quad src srci srcend dc)
+  (define (get srci) (if (< srci srcend) (dc (bytes-ref src srci)) 0))
   (+ (arithmetic-shift (get (+ srci 0)) 18)
      (arithmetic-shift (get (+ srci 1)) 12)
      (arithmetic-shift (get (+ srci 2))  6)
@@ -137,6 +140,9 @@
 
 ;; ----------------------------------------
 
+(define (multiple-ceiling n d)
+  (+ n (modulo (- n) d)))
+
 ;; coerce-endcodes : Symbol (U Bytes[2] #f 'url) -> Bytes[2]
 (define (coerce-endcodes who v)
   (cond [(eq? v #f) std-endcodes]
@@ -144,26 +150,14 @@
         [(and (bytes? v) (= 2 (bytes-length v))) v]
         [else (error who "endcodes is not a byte string of length 2\n  endcodes: ~e" v)]))
 
-;; Returns a regexp that recognizes contiguous base64-encoded characters.
-(define (get-content-rx endcodes)
-  (cond [(equal? endcodes std-endcodes)
-         #rx#"[A-Za-z0-9+/]+"]
-        [(equal? endcodes alt-endcodes)
-         #rx#"[A-Za-z0-9./]+"]
-        [(equal? endcodes url-endcodes)
-         #rx#"[A-Za-z0-9_-]+$"]
-        [else
-         (byte-regexp (format "(?:[A-Za-z0-9]|~a|~a)+"
-                              (regexp-quote (bytes (bytes-ref endcodes 0)))
-                              (regexp-quote (bytes (bytes-ref endcodes 1)))))]))
-
 ;; ============================================================
 
 ;; base64-encode : (U String Bytes InputPort) -> Bytes
 (define (base64-encode src
                        #:endcodes [endcodes0 #f]
-                       #:line [line #f] #:line-sep [line-sep #"\r\n"]
-                       #:pad? [pad? #f] #:who [who 'base64-encode])
+                       #:line [line #f] #:line-end [line-sep #"\r\n"]
+                       #:pad? [pad? (and line #t)]
+                       #:who [who 'base64-encode])
   (define endcodes (coerce-endcodes who endcodes0))
   (cond [(bytes? src)
          (base64-encode-bytes who src endcodes line line-sep pad?)]
@@ -177,8 +171,9 @@
 
 (define (base64-encode-stream in out
                               #:endcodes [endcodes0 #f]
-                              #:line [line #f] #:line-sep [line-sep #"\r\n"]
-                              #:pad? [pad? #f] #:who [who 'base64-encode-stream])
+                              #:line [line #f] #:line-end [line-sep #"\r\n"]
+                              #:pad? [pad? (and line #t)]
+                              #:who [who 'base64-encode-stream])
   (define endcodes (coerce-endcodes who endcodes0))
   (base64-encode-port who in out endcodes line line-sep pad?))
 
@@ -196,13 +191,17 @@
         [else (do-enc src)]))
 
 (define (base64-encode-port who src out endcodes line line-sep pad?)
-  (define CHUNK 400)
-  (define (do-enc bs) (encode bs endcodes pad?))
+  (define CHUNK0 900) ;; multiple of 3
+  (define CHUNK
+    (cond [line (let ([in-line (* 3 (quotient line 4))])
+                  (multiple-ceiling CHUNK0 in-line))]
+          [else CHUNK0]))
+  (define (do-enc bs)
+    (base64-encode-bytes who bs endcodes line line-sep pad?))
   (let loop ()
-    (define line-src (read-bytes CHUNK src))
-    (when (bytes? line-src)
-      (write-bytes (do-enc line-src) out)
-      (write-bytes line-sep out)
+    (define chunk (read-bytes CHUNK src))
+    (when (bytes? chunk)
+      (write-bytes (do-enc chunk) out)
       (loop))))
 
 ;; ------------------------------------------------------------
@@ -215,12 +214,12 @@
   (define endcodes (coerce-endcodes who endcodes0))
   (define content-rx (get-content-rx endcodes))
   (cond [(bytes? src)
-         (base64-decode-bytes who src endcodes content-rx mode)]
+         (base64-decode-bytes who src endcodes content-rx mode #f)]
         [(string? src)
-         (base64-decode-bytes who (string->bytes/utf-8 src) endcodes content-rx mode)]
+         (base64-decode-bytes who (string->bytes/utf-8 src) endcodes content-rx mode #t)]
         [(input-port? src)
          (define out (open-output-bytes))
-         (base64-decode-port who src endcodes content-rx mode)
+         (base64-decode-port who src out endcodes content-rx mode)
          (get-output-bytes out)]))
 
 (define (base64-decode-stream in out
@@ -231,32 +230,93 @@
   (define content-rx (get-content-rx endcodes))
   (base64-decode-port who in out endcodes content-rx mode))
 
-(define (base64-decode-bytes who src endcodes content-rx mode)
-  (define (do-dec bs) (decode bs endcodes #:who who))
-  (define content-ranges (regexp-match-positions* content-rx src))
-  (case mode
-    [(strict)
-     (cond [(zero? (bytes-length src)) #""]
-           [(equal? content-ranges (list (cons 0 (bytes-length src))))
-            (do-dec src)]
-           [else (error who "bad base64 encoding (strict mode)\n  input: ~e" src)])]
-    [else
-     (case mode
-       [(whitespace)
-        (for/fold ([start 0]) ([r (in-list content-ranges)])
-          (unless (regexp-match? #px#"^[=[:space:]]*$" src start (car r))
-            (error who "bad base64 encoding\n  input: ~e" src))
-          (cdr r))]
-       [else (void)])
-     (define out (open-output-bytes))
-     (for ([r (in-list content-ranges)])
-       (write-bytes (do-dec (subbytes src (car r) (cdr r))) out))
-     (get-output-bytes out)]))
+;; Returns an anchored regexp that recognizes contiguous base64-encoded characters.
+(define (get-content-rx endcodes)
+  (cond [(equal? endcodes std-endcodes)
+         #rx#"^[A-Za-z0-9+/]+"]
+        [(equal? endcodes alt-endcodes)
+         #rx#"^[A-Za-z0-9./]+"]
+        [(equal? endcodes url-endcodes)
+         #rx#"^[A-Za-z0-9_-]+$"]
+        [else
+         (byte-regexp
+          (bytes-append #"^(?:[A-Za-z0-9]|"
+                        (regexp-quote (bytes (bytes-ref endcodes 0)))
+                        #"|"
+                        (regexp-quote (bytes (bytes-ref endcodes 1)))
+                        #")+"))]))
 
-(define (base64-decode-port who src out endcodes content-rx mode)
-  (define CHUNK 300)
+(define (base64-decode-bytes who src endcodes content-rx mode orig-string?)
+  (define (bad pos [extra ""])
+    (decode-error (format "~a: bad base64 encoding~a\n  input: ~e" who extra src)
+                  src orig-string? pos))
+  (define (do-dec start end)
+    (unless (ok-segment-length? (- end start))
+      (bad end (format " (invalid segment length)\n  length: ~s" (- end start))))
+    (decode src endcodes start end #:who who))
+  (cond [(zero? (bytes-length src)) #""]
+        [(eq? mode 'strict)
+         (define r (regexp-match-positions1 content-rx src 0))
+         (unless (and r (= (cdr r) (bytes-length src)))
+           (bad (if r (cdr r) 0) " (strict mode)"))
+         (do-dec 0 (bytes-length src))]
+        [(eq? mode 'whitespace)
+         (define out (open-output-bytes))
+         (define (loop/whitespace start)
+           (cond [(regexp-match-positions1 #px#"^[=[:space:]]+" src start)
+                  => (lambda (r) (loop/content (cdr r)))]
+                 [else (loop/content start)]))
+         (define (loop/content start)
+           (when (< start (bytes-length src))
+             (cond [(regexp-match-positions1 content-rx src start)
+                    => (lambda (r)
+                         (write-bytes (do-dec (car r) (cdr r)) out)
+                         (loop/whitespace (cdr r)))]
+                   [else (bad start)])))
+         (loop/whitespace 0)
+         (get-output-bytes out)]
+        #;
+        [else
+         (define out (open-output-bytes))
+         (base64-decode-port who (open-input-bytes src) out endcodes content-rx mode)
+         (get-output-bytes out)]))
+
+(define (base64-decode-port who src out endcodes content-rx mode [CHUNK 400])
+  ;; PRE: CHUNK is multiple of 4
+  (define (bad [details ""])
+    (define-values (line col pos) (port-next-location src))
+    (raise-read-error (format "~a: bad base64 encoding~a" who details)
+                      (object-name src) line col (add1 pos) #f))
+  (define (do-dec bs)
+    (unless (ok-segment-length? (bytes-length bs))
+      (bad (format " (invalid segment length)\n  length: ~s" (bytes-length bs))))
+    (decode bs endcodes #:who who))
   (let loop ()
-    (define chunk (read-bytes CHUNK src))
-    (when (bytes? chunk)
-      (write-bytes (base64-decode-bytes who chunk endcodes content-rx mode) out)
-      (loop))))
+    ;; if allowed, skip whitespace and padding bytes
+    (case mode
+      [(strict) (void)]
+      [(whitespace) (void (regexp-match? #px#"^[=[:space:]]*" src))])
+    ;; try to read up to CHUNK content bytes
+    (cond [(regexp-try-match content-rx src 0 CHUNK)
+           => (lambda (m)
+                (write-bytes (do-dec (car m)) out)
+                (loop))]
+          [(eof-object? (peek-byte src))
+           (void)]
+          [else
+           (bad (case mode [(strict) " (strict mode)"] [else ""]))])))
+
+(define (ok-segment-length? len)
+  #;(not (= 1 (remainder len 4)))
+  (not (= 1 (bitwise-bit-field len 0 2))))
+
+;; regexp-match-positions1 : Regexp String/Bytes Nat -> (cons Nat Nat) or #f
+(define (regexp-match-positions1 rx input start)
+  (cond [(regexp-match-positions rx input start) => car] [else #f]))
+
+(define (decode-error msg src orig-string? pos)
+  (define-values (line col)
+    (let ([ms (regexp-match-positions* #rx#"\r\n|\r|\n" src)])
+      (values (add1 (length ms))
+              (- pos (cond [(pair? ms) (cdr (last ms))] [else 0])))))
+  (raise-read-error msg (if orig-string? 'string 'bytes) line col (add1 pos) #f))
