@@ -74,7 +74,7 @@
   (define LEN (+ 320 (random 20)))
   (random-test/len LEN))
 
-(define (add-whitespace buf)
+(define (add-whitespace4 buf)
   (define (make-whitespace len)
     (make-string len #\space))
   (define out (open-output-bytes))
@@ -94,8 +94,30 @@
   (check-equal? (base64-decode (open-input-bytes enc)) bs)
   ;; Check insertion of whitespace (at mod 4 positions) preserves meaning
   (for ([j (in-range 5)])
-    (check-equal? (base64-decode (add-whitespace enc)) bs)
-    (check-equal? (base64-decode (open-input-bytes (add-whitespace enc))) bs)))
+    (check-equal? (base64-decode (add-whitespace4 enc)) bs)
+    (check-equal? (base64-decode (open-input-bytes (add-whitespace4 enc))) bs)))
+
+(define (add-whitespace1 buf)
+  (define (make-whitespace len)
+    (make-string len #\space))
+  (define out (open-output-bytes))
+  (for ([b (in-bytes buf)] [k (in-naturals)])
+    (write-string (make-whitespace (random 2)) out)
+    (write-byte b out))
+  (get-output-bytes out))
+
+(test-case "Roundtrip + rountrip after whitespace insertion"
+  (for ([i (in-range 100)])
+    (define LEN (+ 200 (random 20)))
+    (define bs (random-bytes LEN))
+    (define enc (base64-encode bs))
+    ;; Check rountrip
+    (check-equal? (base64-decode enc) bs)
+    (check-equal? (base64-decode (open-input-bytes enc)) bs)
+    ;; Check insertion of whitespace (at any position) preserves meaning
+    (for ([j (in-range 5)])
+      (check-equal? (base64-decode (add-whitespace1 enc) #:mode 'padding) bs)
+      (check-equal? (base64-decode (open-input-bytes (add-whitespace1 enc)) #:mode 'padding) bs))))
 
 ;; ----------------------------------------
 ;; Error tests

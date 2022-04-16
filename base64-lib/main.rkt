@@ -29,12 +29,12 @@
           [base64-decode
            (->* [input/c]
                 [#:endcodes endcodes/c
-                 #:mode (or/c 'strict 'whitespace)]
+                 #:mode (or/c 'strict 'whitespace 'padding)]
                 bytes?)]
           [base64-decode-stream
            (->* [input/c output-port?]
                 [#:endcodes endcodes/c
-                 #:mode (or/c 'strict 'whitespace)]
+                 #:mode (or/c 'strict 'whitespace 'padding)]
                 void?)]))
 
 (define input/c (or/c bytes? string? input-port?))
@@ -250,36 +250,72 @@
   (define (bad pos [extra ""])
     (decode-error (format "~a: bad base64 encoding~a\n  input: ~e" who extra src)
                   src orig-string? pos))
-  (define (do-dec start end)
-    (unless (ok-segment-length? (- end start))
-      (bad end (format " (invalid segment length)\n  length: ~s" (- end start))))
-    (decode src endcodes start end #:who who))
   (cond [(zero? (bytes-length src)) #""]
         [(eq? mode 'strict)
          (define r (regexp-match-positions1 content-rx src 0))
          (unless (and r (= (cdr r) (bytes-length src)))
            (bad (if r (cdr r) 0) " (strict mode)"))
-         (do-dec 0 (bytes-length src))]
-        [(eq? mode 'whitespace)
+         (let ([len (bytes-length src)])
+           (unless (ok-segment-length? len)
+             (bad len (format " (invalid segment length)\n  length: ~s" len)))
+           (decode src endcodes 0 len #:who who))]
+        [(memq mode '(padding whitespace))
          (define out (open-output-bytes))
-         (define (loop/whitespace start)
-           (cond [(regexp-match-positions1 #px#"^[=[:space:]]+" src start)
-                  => (lambda (r) (loop/content (cdr r)))]
-                 [else (loop/content start)]))
-         (define (loop/content start)
-           (when (< start (bytes-length src))
-             (cond [(regexp-match-positions1 content-rx src start)
-                    => (lambda (r)
-                         (write-bytes (do-dec (car r) (cdr r)) out)
-                         (loop/whitespace (cdr r)))]
-                   [else (bad start)])))
-         (loop/whitespace 0)
+         (define wsmode? (eq? mode 'whitespace))
+         (define (loop start partial)
+           (cond [(not (< start (bytes-length src)))
+                  (end-segment start partial)
+                  (void)]
+                 [(regexp-match-positions1 content-rx src start)
+                  => (lambda (r)
+                       (define partial*
+                         (decode/partial src partial endcodes (car r) (cdr r) out #:who who))
+                       (loop (cdr r) partial*))]
+                 [(cond [wsmode? (regexp-match-positions1 #px#"^[=[:space:]]+" src start)]
+                        [else (regexp-match-positions1 #px#"^[=]+" src start)])
+                  => (lambda (r)
+                       (end-segment start partial)
+                       (loop (cdr r) #f))]
+                 [(regexp-match-positions1 #px#"^[[:space:]]+" src start)
+                  => (lambda (r)
+                       (loop (cdr r) partial))]
+                 [else (bad start)]))
+         (define (end-segment pos partial)
+           (unless (decode/end-segment partial endcodes out #:who who)
+             (bad pos " (invalid segment length)")))
+         ;; ----
+         (loop 0 #f)
          (get-output-bytes out)]
-        #;
         [else
          (define out (open-output-bytes))
          (base64-decode-port who (open-input-bytes src) out endcodes content-rx mode)
          (get-output-bytes out)]))
+
+;; decode/partial : ... -> (U #f Bytes[1..3])
+(define (decode/partial src partial endcodes start end out #:who who)
+  (define len (- end start))
+  (cond [partial
+         (define plen (bytes-length partial))
+         (define copy-len (min (- 4 plen) len))
+         (define partial* (bytes-append partial (subbytes src start (+ start copy-len))))
+         (cond [(< (bytes-length partial*) 4)
+                partial*]
+               [else
+                (write-bytes (decode partial* endcodes 0 4 #:who who) out)
+                (decode/partial src #f endcodes (+ start copy-len) end out #:who who)])]
+        [else
+         (define end* (- end (modulo len 4)))
+         (write-bytes (decode src endcodes start end* #:who who) out)
+         (and (< end* end) (subbytes src end* end))]))
+
+;; decode/end-segment : ... -> (U #f Nat)
+;; returns #f to indicate invalid segment length
+(define (decode/end-segment partial endcodes out #:who who)
+  (cond [partial
+         (cond [(ok-segment-length? (bytes-length partial))
+                (write-bytes (decode partial endcodes 0 (bytes-length partial) #:who who) out)]
+               [else #f #| invalid segment length |#])]
+        [else 0]))
 
 (define (base64-decode-port who src out endcodes content-rx mode [CHUNK 400])
   ;; PRE: CHUNK is multiple of 4
@@ -287,24 +323,33 @@
     (define-values (line col pos) (port-next-location src))
     (raise-read-error (format "~a: bad base64 encoding~a" who details)
                       (object-name src) line col (add1 pos) #f))
-  (define (do-dec bs)
-    (unless (ok-segment-length? (bytes-length bs))
-      (bad (format " (invalid segment length)\n  length: ~s" (bytes-length bs))))
-    (decode bs endcodes #:who who))
-  (let loop ()
-    ;; if allowed, skip whitespace and padding bytes
-    (case mode
-      [(strict) (void)]
-      [(whitespace) (void (regexp-match? #px#"^[=[:space:]]*" src))])
-    ;; try to read up to CHUNK content bytes
-    (cond [(regexp-try-match content-rx src 0 CHUNK)
-           => (lambda (m)
-                (write-bytes (do-dec (car m)) out)
-                (loop))]
-          [(eof-object? (peek-byte src))
+  (define (try-read rx) (regexp-try-match rx src 0 CHUNK))
+  (define (loop partial)
+    (cond [(eof-object? (peek-byte src))
+           (end-segment partial)
            (void)]
+          [(try-read content-rx) ;; try read up to CHUNK content bytes
+           => (lambda (m)
+                (define buf (car m))
+                (define buflen (bytes-length buf))
+                (loop (decode/partial buf partial endcodes 0 buflen out #:who who)))]
+          [(case mode
+             [(whitespace) (try-read #px#"^[=[:space:]]+")]
+             [(padding) (try-read #px#"^[=]+")]
+             [else #f])
+           (end-segment partial)
+           (loop #f)]
+          [(case mode
+             [(padding) (try-read #px#"^[[:space:]]+")]
+             [else #f])
+           (loop partial)]
           [else
-           (bad (case mode [(strict) " (strict mode)"] [else ""]))])))
+           (bad (case mode [(strict) " (strict mode)"] [else ""]))]))
+  (define (end-segment partial)
+    (unless (decode/end-segment partial endcodes out #:who who)
+      (bad " (invalid segment length)")))
+  ;; ----
+  (loop #f))
 
 (define (ok-segment-length? len)
   #;(not (= 1 (remainder len 4)))

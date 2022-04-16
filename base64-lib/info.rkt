@@ -2,7 +2,7 @@
 
 ;; pkg info
 
-(define version "1.0")
+(define version "1.1")
 (define collection "base64")
 (define deps '(["base" #:version "7.4"]))
 (define pkg-authors '(ryanc))
