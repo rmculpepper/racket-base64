@@ -45,18 +45,9 @@
 
 ;; Note: Nat[6-bit] = [0, 63], etc
 
-;; ------------------------------------------------------------
-;; Encode/decode between Nat[6-bit] and printable character
-
-(define b64-prefix #"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 (define std-endcodes #"+/")
 (define url-endcodes #"-_") ;; see https://tools.ietf.org/html/rfc4648#section-5
 (define alt-endcodes #"./") ;; used by passlib
-
-;; encode1 : Bytes[2] Nat[6-bit] -> Byte
-(define (encode1 endcodes k)
-  (cond [(< k 62) (bytes-ref b64-prefix k)]
-        [(< k 64) (bytes-ref endcodes (- k 62))]))
 
 ;; decode1 : Bytes[2] Byte -> Nat[6-bit]
 (define (decode1 endcodes n #:who [who 'decode1])
@@ -72,40 +63,60 @@
 
 ;; ------------------------------------------------------------
 
-;; encode : Bytes Bytes[2] Boolean -> Bytes
-(define (encode src endcodes pad?)
-  (define (code k) (encode1 endcodes k))
-  (define srclen (bytes-length src))
-  (define outlen
-    (+ (* 4 (quotient srclen 3))
-       (if pad?
-           (case (remainder srclen 3) [(0) 0] [else 4])
-           (case (remainder srclen 3) [(0) 0] [(1) 2] [(2) 3]))))
-  (define out (make-bytes outlen))
-  (for ([srci (in-range 0 srclen 3)]
-        [outi (in-range 0 outlen 4)])
-    (define n (read-triplet src srci srclen))
-    (write-quad out outi outlen n code))
-  (when pad?
-    (define padlen (case (remainder srclen 3) [(0) 0] [(1) 2] [(2) 1]))
-    (for ([i (in-range (- outlen padlen) outlen)])
-      (bytes-set! out i (char->integer #\=))))
-  out)
+(module encode racket/base
+  (require racket/fixnum racket/performance-hint)
+  (provide encode)
+  (#%declare #:unsafe)
 
-;; read-triplet : Bytes Nat Nat -> Nat[6-bit]
-(define (read-triplet src srci srclen)
-  (define (get srci) (if (< srci srclen) (bytes-ref src srci) 0))
-  (+ (arithmetic-shift (get (+ srci 0)) 16)
-     (arithmetic-shift (get (+ srci 1)) 8)
-     (get (+ srci 2))))
+  (define b64-prefix #"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 
-;; write-quad : Bytes Nat Nat Nat[24-bit] (Nat[6-bit] -> Byte) -> Void
-(define (write-quad out outi outlen n code)
-  (define (put outi v) (when (< outi outlen) (bytes-set! out outi v)))
-  (put (+ outi 0) (code (bitwise-bit-field n 18 24)))
-  (put (+ outi 1) (code (bitwise-bit-field n 12 18)))
-  (put (+ outi 2) (code (bitwise-bit-field n 6  12)))
-  (put (+ outi 3) (code (bitwise-bit-field n 0  6))))
+  ;; encode1 : Bytes[2] Nat[6-bit] -> Byte
+  ;; Encodes a single Nat[6-bit] into a printable character
+  (define (encode1 endcodes k)
+    (if (fx< k 62) 
+        (bytes-ref b64-prefix k) 
+        (bytes-ref endcodes (fx- k 62))))
+
+  ;; write-quad : Bytes Nat Nat Nat[24-bit] (Nat[6-bit] -> Byte) -> Void
+  (define-inline (write-quad out outi outlen n code)
+    (define (put outi v) (when (fx< outi outlen) (bytes-set! out outi v)))
+    (put (fx+ outi 0) (code (fxand (fxrshift n 18) #x3F)))
+    (put (fx+ outi 1) (code (fxand (fxrshift n 12) #x3F)))
+    (put (fx+ outi 2) (code (fxand (fxrshift n 6) #x3F)))
+    (put (fx+ outi 3) (code (fxand (fxrshift n 0) #x3F))))
+
+  ;; read-triplet : Bytes Nat Nat -> Nat[6-bit]
+  (define-inline (read-triplet src srci srclen)
+    (define (get srci) (if (fx< srci srclen) (bytes-ref src srci) 0))
+    (fx+ (fxlshift (get (fx+ srci 0)) 16)
+         (fxlshift (get (fx+ srci 1)) 8)
+         (get (fx+ srci 2))))
+
+  ;; encode : Bytes Bytes[2] Boolean -> Bytes
+  (define (encode src endcodes pad?)
+    (define (code k) (encode1 endcodes k))
+    (define srclen (bytes-length src))
+    (define outlen
+      (fx+ (fx* 4 (fxquotient srclen 3))
+           (if pad?
+               (case (fxremainder srclen 3) [(0) 0] [else 4])
+               (case (fxremainder srclen 3) [(0) 0] [(1) 2] [(2) 3]))))
+
+    (define out (make-bytes outlen))
+    (let loop ([i 0])
+      (define srci (fx* i 3))
+      (define outi (fx* i 4))
+      (when (fx< srci srclen)
+        (define n (read-triplet src srci srclen))
+        (write-quad out outi outlen n code)
+        (loop (fx+ i 1))))
+    (when pad?
+      (define padlen (case (fxremainder srclen 3) [(0) 0] [(1) 2] [(2) 1]))
+      (for ([i (in-range (fx- outlen padlen) outlen)])
+        (bytes-set! out i (char->integer #\=))))
+    out))
+
+(require 'encode)
 
 ;; ------------------------------------------------------------
 
@@ -365,3 +376,5 @@
       (values (add1 (length ms))
               (- pos (cond [(pair? ms) (cdr (last ms))] [else 0])))))
   (raise-read-error msg (if orig-string? 'string 'bytes) line col (add1 pos) #f))
+
+
